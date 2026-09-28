@@ -160,13 +160,13 @@ export function ImportResumeDialog(_: DialogProps<"resume.import">) {
 
 			setIsImporting(true);
 
-			// A PDF parsed in the browser never touches a provider, so promising one would be a lie.
-			const isLocalPdf = value.type === "pdf" && !hasUsableProvider;
+			// A LinkedIn export, or a PDF parsed in the browser, never touches a provider, so promising one would be a lie.
+			const isLocalParse = value.type === "linkedin" || (value.type === "pdf" && !hasUsableProvider);
 
 			const toastId = toast.add({
 				type: "loading",
 				title: t`Importing your resume...`,
-				description: isLocalPdf
+				description: isLocalParse
 					? t`This may take a moment. Please do not close the window or refresh the page.`
 					: t`This may take a few minutes, depending on the response of the AI provider. Please do not close the window or refresh the page.`,
 			});

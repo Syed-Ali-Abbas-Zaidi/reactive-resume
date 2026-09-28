@@ -3,10 +3,31 @@ import { unzipSync } from "fflate";
 import { resumeDataSchema } from "@reactive-resume/schema/resume/data";
 import { defaultResumeData } from "@reactive-resume/schema/resume/default";
 import { generateId } from "@reactive-resume/utils/string";
-import { formatPeriod, formatSingleDate } from "./date";
+import { formatDate } from "./date";
 import { rethrowAsImportError } from "./error";
-import { toHtmlDescription } from "./html";
+import { toHtml } from "./html";
 import { parseLevel } from "./level";
+
+const LINKEDIN_CSVS = new Set([
+	"profile.csv",
+	"positions.csv",
+	"education.csv",
+	"skills.csv",
+	"languages.csv",
+	"certifications.csv",
+]);
+
+// Real LinkedIn CSVs are kilobytes; the cap keeps a crafted archive from exhausting the tab's memory.
+const MAX_CSV_BYTES = 5 * 1024 * 1024;
+
+// LinkedIn's five fixed proficiency options, mapped onto the 0-5 level scale.
+const LANGUAGE_LEVELS: Record<string, number> = {
+	"native or bilingual": 5,
+	"full professional": 4,
+	"professional working": 3,
+	"limited working": 2,
+	elementary: 1,
+};
 
 const MONTHS: Record<string, string> = {
 	jan: "01",
@@ -24,26 +45,33 @@ const MONTHS: Record<string, string> = {
 };
 
 // LinkedIn's "Started On" / "Finished On" cells are "Mon YYYY" (e.g. "Jan 2020") or a bare year.
-// Converts them to the partial-ISO strings formatPeriod/formatSingleDate expect ("YYYY-MM"/"YYYY").
-function parseLinkedInDate(value: string | undefined): string | undefined {
-	const trimmed = value?.trim();
-	if (!trimmed) return undefined;
-
+// Anything else is kept verbatim rather than dropped.
+function formatLinkedInDate(value = ""): string {
+	const trimmed = value.trim();
 	const monthYear = /^([A-Za-z]{3})[a-z]*\s+(\d{4})$/.exec(trimmed);
-	if (monthYear) {
-		const month = MONTHS[(monthYear[1] ?? "").toLowerCase()];
-		if (month) return `${monthYear[2]}-${month}`;
-	}
-
-	if (/^\d{4}$/.test(trimmed)) return trimmed;
-
-	return undefined;
+	const month = MONTHS[monthYear?.[1]?.toLowerCase() ?? ""];
+	return monthYear && month ? formatDate(`${monthYear[2]}-${month}`) : trimmed;
 }
+
+// Only an empty end cell means the entry is ongoing; an unrecognised one must not read as "Present".
+function formatLinkedInPeriod(start?: string, end?: string): string {
+	const from = formatLinkedInDate(start);
+	const to = formatLinkedInDate(end);
+	if (!from) return to;
+	return `${from} - ${to || "Present"}`;
+}
+
+const textToHtml = (text = "") => toHtml(text.split(/\r\n?|\n/));
+
+const languageLevel = (proficiency = "") =>
+	LANGUAGE_LEVELS[proficiency.toLowerCase().replace(/\s*proficiency$/, "")] ?? parseLevel(proficiency);
+
+const basename = (path: string) => path.slice(path.lastIndexOf("/") + 1).toLowerCase();
 
 // Minimal RFC-4180-ish CSV parser: handles quoted fields, escaped quotes (""), and commas/newlines
 // inside quotes. LinkedIn's export files are small, so a non-streaming parser is enough.
-function parseCsv(input: string): string[][] {
-	const text = input.replace(/^﻿/, "");
+// No BOM handling needed: TextDecoder strips a leading UTF-8 BOM before the text gets here.
+function parseCsv(text: string): string[][] {
 	const rows: string[][] = [];
 	let row: string[] = [];
 	let field = "";
@@ -98,7 +126,7 @@ function rowsToRecords(rows: string[][]): Record<string, string>[] {
 
 function findCsv(files: Record<string, Uint8Array>, fileName: string): Record<string, string>[] {
 	const decoder = new TextDecoder();
-	const key = Object.keys(files).find((path) => path.toLowerCase().endsWith(fileName));
+	const key = Object.keys(files).find((path) => basename(path) === fileName);
 	if (!key) return [];
 	return rowsToRecords(parseCsv(decoder.decode(files[key])));
 }
@@ -112,13 +140,25 @@ const linkWebsite = (url?: string) => (url ? { url, label: url, inlineLink: fals
  */
 export function parseLinkedInExport(zipBytes: Uint8Array): ResumeData {
 	let files: Record<string, Uint8Array>;
+	let oversized = "";
 
 	try {
-		files = unzipSync(zipBytes);
+		// Only inflate the CSVs we read; the rest of the export (messages, media, ...) can be large.
+		files = unzipSync(zipBytes, {
+			filter: (file) => {
+				if (!LINKEDIN_CSVS.has(basename(file.name))) return false;
+				if (file.originalSize > MAX_CSV_BYTES) oversized ||= file.name;
+				return !oversized;
+			},
+		});
 	} catch {
 		throw new Error(
 			'This file could not be read as a ZIP archive. Export your data from LinkedIn\'s "Get a copy of your data" page and upload the ZIP as-is.',
 		);
+	}
+
+	if (oversized) {
+		throw new Error(`"${oversized}" in this ZIP is larger than 5 MB, which is too large for a LinkedIn data export.`);
 	}
 
 	const profile = findCsv(files, "profile.csv")[0];
@@ -148,7 +188,7 @@ export function parseLinkedInExport(zipBytes: Uint8Array): ResumeData {
 		};
 
 		if (profile.Summary) {
-			result.summary = { ...defaultResumeData.summary, content: `<p>${profile.Summary}</p>`, hidden: false };
+			result.summary = { ...defaultResumeData.summary, content: textToHtml(profile.Summary), hidden: false };
 		}
 	}
 
@@ -162,10 +202,10 @@ export function parseLinkedInExport(zipBytes: Uint8Array): ResumeData {
 				company: position["Company Name"] ?? "",
 				position: position.Title || "",
 				location: position.Location || "",
-				period: formatPeriod(parseLinkedInDate(position["Started On"]), parseLinkedInDate(position["Finished On"])),
+				period: formatLinkedInPeriod(position["Started On"], position["Finished On"]),
 				website: emptyWebsite,
 				roles: [],
-				description: toHtmlDescription(position.Description),
+				description: textToHtml(position.Description),
 			})),
 		};
 	}
@@ -182,9 +222,9 @@ export function parseLinkedInExport(zipBytes: Uint8Array): ResumeData {
 				area: "",
 				grade: "",
 				location: "",
-				period: formatPeriod(parseLinkedInDate(edu["Start Date"]), parseLinkedInDate(edu["End Date"])),
+				period: formatLinkedInPeriod(edu["Start Date"], edu["End Date"]),
 				website: emptyWebsite,
-				description: edu.Notes ? `<p>${edu.Notes}</p>` : "",
+				description: textToHtml(edu.Notes),
 			})),
 		};
 	}
@@ -215,7 +255,7 @@ export function parseLinkedInExport(zipBytes: Uint8Array): ResumeData {
 				hidden: false,
 				language: lang.Name ?? "",
 				fluency: lang.Proficiency || "",
-				level: parseLevel(lang.Proficiency),
+				level: languageLevel(lang.Proficiency),
 			})),
 		};
 	}
@@ -229,7 +269,7 @@ export function parseLinkedInExport(zipBytes: Uint8Array): ResumeData {
 				hidden: false,
 				title: cert.Name ?? "",
 				issuer: cert.Authority || "",
-				date: formatSingleDate(parseLinkedInDate(cert["Started On"])),
+				date: formatLinkedInDate(cert["Started On"]),
 				website: linkWebsite(cert.Url),
 				description: "",
 			})),

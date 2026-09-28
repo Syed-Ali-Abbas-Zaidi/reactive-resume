@@ -104,4 +104,60 @@ describe("parseLinkedInExport", () => {
 		const result = parseLinkedInExport(zip);
 		expect(result.sections.education.items[0]!.school).toBe("MIT");
 	});
+
+	it("escapes CSV text and turns line breaks into HTML", () => {
+		const zip = makeZip({
+			"Profile.csv": 'First Name,Summary\nJane,"Line one\nLine <two> & more"\n',
+			"Positions.csv": 'Company Name,Description\nAcme,"Led a team\n• Built <script>x</script>\n• Shipped C++ & Go"\n',
+		});
+
+		const result = parseLinkedInExport(zip);
+		expect(result.summary.content).toBe("<p>Line one</p><p>Line &lt;two&gt; &amp; more</p>");
+		expect(result.sections.experience.items[0]!.description).toBe(
+			"<ul><li>Led a team</li><li>Built &lt;script&gt;x&lt;/script&gt;</li><li>Shipped C++ &amp; Go</li></ul>",
+		);
+	});
+
+	it("keeps an unrecognised end date verbatim instead of showing the role as ongoing", () => {
+		const zip = makeZip({
+			"Positions.csv": "Company Name,Started On,Finished On\nAcme,Jan 2020,2021-06-30\n",
+		});
+
+		expect(parseLinkedInExport(zip).sections.experience.items[0]!.period).toBe("January 2020 - 2021-06-30");
+	});
+
+	it("reads headers behind a UTF-8 byte order mark", () => {
+		const zip = makeZip({ "Positions.csv": "﻿Company Name,Title\nAcme,Engineer\n" });
+		expect(parseLinkedInExport(zip).sections.experience.items[0]!.company).toBe("Acme");
+	});
+
+	it("matches CSVs by exact file name, not suffix", () => {
+		const zip = makeZip({
+			"Learning_Profile.csv": "First Name,Last Name\nWrong,Person\n",
+			"Education.csv": "School Name\nMIT\n",
+		});
+
+		expect(parseLinkedInExport(zip).basics.name).toBe("");
+	});
+
+	it("maps LinkedIn's language proficiency options onto levels", () => {
+		const zip = makeZip({
+			"Education.csv": "School Name\nMIT\n",
+			"Languages.csv": [
+				"Name,Proficiency",
+				"A,Native or bilingual proficiency",
+				"B,Full professional proficiency",
+				"C,Professional working proficiency",
+				"D,Limited working proficiency",
+				"E,Elementary proficiency",
+			].join("\n"),
+		});
+
+		expect(parseLinkedInExport(zip).sections.languages.items.map((item) => item.level)).toEqual([5, 4, 3, 2, 1]);
+	});
+
+	it("rejects an oversized CSV entry", () => {
+		const zip = makeZip({ "Positions.csv": `Company Name\n${"a".repeat(5 * 1024 * 1024)}\n` });
+		expect(() => parseLinkedInExport(zip)).toThrow(/larger than 5 MB/);
+	});
 });
